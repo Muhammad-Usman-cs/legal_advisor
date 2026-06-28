@@ -5,7 +5,7 @@ from database import get_db
 from models import User, Conversation, Message
 from schemas import ChatRequest, ChatResponse, ConversationResponse, ConversationWithMessages
 from security import get_current_user
-from services.ai_service import embedding_service, groq_service
+from services.ai_service import legal_chain
 
 # ---------------------------------------------------------------------------
 # All routes here are protected — every endpoint requires a valid JWT.
@@ -33,10 +33,12 @@ def send_message(
     Main chat endpoint. Full flow:
       1. Get existing conversation or create a new one
       2. Fetch the last N messages for memory
-      3. Search ChromaDB for relevant Pakistani law
-      4. Call Groq with [system + law context + history + new message]
-      5. Save both the user message and AI reply to the database
-      6. Return the AI reply
+      3. Pass message + history to the LangChain chain, which internally:
+           - embeds the query and retrieves relevant law sections (MMR)
+           - builds the prompt with context + history + question
+           - calls Groq and returns the reply
+      4. Save both the user message and AI reply to the database
+      5. Return the AI reply
 
     conversation_id in the request is optional — omit it to start a new chat.
     """
@@ -74,14 +76,10 @@ def send_message(
         for msg in reversed(past_messages)
     ]
 
-    # --- Step 3: RAG — retrieve relevant law sections from ChromaDB ---
-    law_context = embedding_service.search(request.message, n_results=5)
-
-    # --- Step 4: call Groq ---
-    reply = groq_service.get_reply(
+    # --- Step 3 + 4: retrieval and generation happen inside the LangChain chain ---
+    reply = legal_chain.get_reply(
         user_message=request.message,
         history=history,
-        law_context=law_context
     )
 
     # --- Step 5: persist both messages ---

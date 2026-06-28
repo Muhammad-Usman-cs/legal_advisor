@@ -1,164 +1,200 @@
 import os
-import chromadb
-from groq import Groq
-from sentence_transformers import SentenceTransformer
+from operator import itemgetter
+
 from dotenv import load_dotenv
+from langchain_chroma import Chroma
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
 # SYSTEM PROMPT
-# This is the personality and instruction set given to Groq on every request.
-# It is injected as the first "system" message in the conversation.
+# Strict grounding rule added: model must only cite sections in [LAW CONTEXT].
+# Without this, the LLM fills gaps from training memory and invents article
+# numbers that sound plausible but are wrong.
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a knowledgeable and empathetic Pakistani legal advisor.
+SYSTEM_PROMPT = """You are a knowledgeable Pakistani legal advisor operating in STRICT GROUNDING MODE.
+
+RULES YOU MUST NEVER BREAK:
+- Only cite law sections that appear word-for-word in the [LAW CONTEXT] block below.
+- If the answer requires a section NOT present in [LAW CONTEXT], respond:
+  "I could not find the specific provision in my loaded documents. Please verify on
+   pakistanlaw.pk or consult a licensed Advocate."
+- Never invent, guess, or recall section numbers from memory.
 
 Your role:
-- Answer legal questions strictly based on Pakistani law (Constitution of Pakistan,
-  PPC, CPC, CRPC, family law, property law, labour law, etc.)
-- When law sections are provided in the context below, cite them by name and section number
-- Clearly distinguish between general legal information and formal legal advice
-- Always recommend consulting a licensed Pakistani lawyer (Advocate) for serious matters
+- Answer legal questions based on Pakistani law (Constitution, PPC, CPC, CRPC, family law, property law, labour law)
+- Cite sections by name and number when they appear in [LAW CONTEXT]
+- Clearly distinguish between legal information and formal legal advice
+- Always recommend consulting a licensed Pakistani Advocate for serious matters
 - Respond in the same language the user writes in (English or Roman/Urdu)
-- Keep answers structured: state the relevant law first, then explain its practical effect
+- Keep answers structured: relevant law first, then its practical effect
 
-What you must NOT do:
-- Invent law sections or cite laws that were not provided to you
-- Give definitive rulings — you inform, not adjudicate
-- Discuss laws of other countries unless explicitly asked for comparison
-"""
+[LAW CONTEXT]
+{context}"""
+
+CHROMA_PATH = "./chroma_db"
+COLLECTION_NAME = "pakistani_law"
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+
+
+def _format_docs(docs: list) -> str:
+    # ---------------------------------------------------------------------------
+    # Converts a list of LangChain Document objects into a single string that
+    # gets injected into the {context} slot in SYSTEM_PROMPT above.
+    # Each document is separated by --- so the LLM can distinguish sections.
+    # ---------------------------------------------------------------------------
+    if not docs:
+        return "No relevant law sections found in the loaded documents."
+    return "\n\n---\n\n".join(doc.page_content for doc in docs)
 
 
 # ---------------------------------------------------------------------------
-# EMBEDDING SERVICE  (sentence-transformers + ChromaDB)
+# LegalAdvisorChain
 #
-# sentence-transformers runs entirely locally — no API key, no rate limits.
-# Model: paraphrase-multilingual-MiniLM-L12-v2
-#   - Supports 50+ languages including Urdu
-#   - Fast on CPU, good quality for semantic search
+# This single class replaces the old EmbeddingService + GroqChatService pair.
+# LangChain lets us express the full RAG pipeline as one composable chain
+# using LCEL (LangChain Expression Language) and the | pipe operator.
 #
-# ChromaDB stores the vectors on disk in ./chroma_db so they persist
-# between server restarts. You only need to ingest documents once.
+# Pipeline (what happens on every get_reply() call):
+#   search_query  ──► retriever ──► _format_docs ──► {context}  ─┐
+#   question      ───────────────────────────────► {question}    ─┤─► prompt ──► llm ──► str
+#   history       ───────────────────────────────► {history}     ─┘
 # ---------------------------------------------------------------------------
 
-class EmbeddingService:
+class LegalAdvisorChain:
     def __init__(self):
-        print("Loading embedding model... (first run downloads ~120MB)")
-        self.model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-
-        # PersistentClient saves the vector store to disk
-        self.client = chromadb.PersistentClient(path="./chroma_db")
-
-        # get_or_create_collection: safe to call on every startup
-        # cosine distance is best for semantic similarity of text
-        self.collection = self.client.get_or_create_collection(
-            name="pakistani_law",
-            metadata={"hnsw:space": "cosine"}
+        # -----------------------------------------------------------------
+        # 1. EMBEDDINGS — HuggingFaceEmbeddings wraps sentence-transformers.
+        #    BAAI/bge-small-en-v1.5 is a retrieval-optimised model trained on
+        #    100M+ question-passage pairs. Much better than the old paraphrase
+        #    model for matching user questions to law document passages.
+        #    normalize_embeddings=True is required by BGE for cosine similarity.
+        # -----------------------------------------------------------------
+        print("Loading embedding model (BAAI/bge-small-en-v1.5)...")
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL,
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
         )
-        print(f"ChromaDB ready — {self.collection.count()} law sections loaded.")
 
-    def add_documents(
-        self,
-        texts: list[str],
-        ids: list[str],
-        metadatas: list[dict] | None = None
-    ) -> None:
-        """
-        Embed and store a batch of law document chunks in ChromaDB.
-        Call this once when ingesting your Pakistani law documents.
-
-        texts     — the actual text of each law section
-        ids       — unique string IDs (e.g. "ppc_section_302")
-        metadatas — optional dicts with extra info (e.g. {"source": "PPC", "section": "302"})
-        """
-        embeddings = self.model.encode(texts, show_progress_bar=True).tolist()
-        self.collection.add(
-            embeddings=embeddings,
-            documents=texts,
-            ids=ids,
-            metadatas=metadatas or [{} for _ in texts]
+        # -----------------------------------------------------------------
+        # 2. VECTOR STORE — LangChain's Chroma wrapper.
+        #    Same ./chroma_db directory as before; LangChain manages the
+        #    ChromaDB client internally so we don't call chromadb directly.
+        # -----------------------------------------------------------------
+        self.vectorstore = Chroma(
+            persist_directory=CHROMA_PATH,
+            embedding_function=self.embeddings,
+            collection_name=COLLECTION_NAME,
         )
-        print(f"Added {len(texts)} documents. Total: {self.collection.count()}")
+        count = self.vectorstore._collection.count()
+        print(f"ChromaDB ready — {count} law sections loaded.")
 
-    def search(self, query: str, n_results: int = 5) -> list[str]:
-        """
-        Find the most relevant law sections for a given user query.
-        Returns a list of raw text strings to inject into the Groq prompt.
-        """
-        total = self.collection.count()
-        if total == 0:
-            return []  # no documents ingested yet
-
-        query_embedding = self.model.encode([query]).tolist()
-        results = self.collection.query(
-            query_embeddings=query_embedding,
-            n_results=min(n_results, total)  # can't request more than what exists
+        # -----------------------------------------------------------------
+        # 3. RETRIEVER — as_retriever() converts the vector store into a
+        #    LangChain Retriever object that the chain can call directly.
+        #
+        #    search_type="mmr": Maximal Marginal Relevance.
+        #    Instead of returning the top-5 most similar chunks (which may
+        #    all be from the same section), MMR fetches 15 candidates then
+        #    picks 5 that are both relevant AND diverse.
+        #    lambda_mult=0.7 means 70% relevance weight, 30% diversity weight.
+        # -----------------------------------------------------------------
+        self.retriever = self.vectorstore.as_retriever(
+            search_type="mmr",
+            search_kwargs={"k": 5, "fetch_k": 15, "lambda_mult": 0.7},
         )
-        return results["documents"][0] if results["documents"] else []
+
+        # -----------------------------------------------------------------
+        # 4. LLM — ChatGroq wraps the Groq API with LangChain's chat model
+        #    interface. It returns a LangChain AIMessage object, not a raw
+        #    string, which is why StrOutputParser() is needed at the end.
+        # -----------------------------------------------------------------
+        self.llm = ChatGroq(
+            model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            max_tokens=2048,
+        )
+
+        # -----------------------------------------------------------------
+        # 5. PROMPT — ChatPromptTemplate.from_messages() builds a structured
+        #    prompt with named slots ({context}, {question}, {history}).
+        #
+        #    MessagesPlaceholder(variable_name="history") inserts the full
+        #    list of prior HumanMessage/AIMessage objects at that position.
+        #    This is how LangChain handles multi-turn conversation memory.
+        # -----------------------------------------------------------------
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", SYSTEM_PROMPT),
+            MessagesPlaceholder(variable_name="history"),
+            ("human", "{question}"),
+        ])
+
+        # -----------------------------------------------------------------
+        # 6. CHAIN (LCEL — LangChain Expression Language)
+        #
+        #    The | operator chains Runnables together. A dict of Runnables
+        #    runs in parallel and merges results into one dict.
+        #
+        #    itemgetter("search_query") extracts that key from the input dict,
+        #    passes it to the retriever, then to _format_docs to get a string.
+        #    itemgetter("question") and itemgetter("history") pass through unchanged.
+        #
+        #    The merged dict feeds into the prompt template, which fills
+        #    {context}, {question}, {history}. The result is a list of
+        #    BaseMessages that the LLM receives. StrOutputParser pulls out
+        #    just the text content from the AIMessage the LLM returns.
+        # -----------------------------------------------------------------
+        self.chain = (
+            {
+                "context": itemgetter("search_query") | self.retriever | _format_docs,
+                "question": itemgetter("question"),
+                "history": itemgetter("history"),
+            }
+            | prompt
+            | self.llm
+            | StrOutputParser()
+        )
+
+    def get_reply(self, user_message: str, history: list[dict]) -> str:
+        # -----------------------------------------------------------------
+        # Build a context-aware search query.
+        # If the user asks a follow-up ("what about for minors?"), the
+        # raw message alone won't retrieve the right section. Prepending
+        # the last user turn gives the retriever more context.
+        # -----------------------------------------------------------------
+        recent_user_turns = [m["content"] for m in history if m["role"] == "user"][-1:]
+        search_query = " ".join(recent_user_turns + [user_message])
+
+        # -----------------------------------------------------------------
+        # Convert history from our DB format {"role": ..., "content": ...}
+        # to LangChain message objects (HumanMessage / AIMessage).
+        # MessagesPlaceholder in the prompt expects this exact format.
+        # -----------------------------------------------------------------
+        lc_history = []
+        for msg in history:
+            if msg["role"] == "user":
+                lc_history.append(HumanMessage(content=msg["content"]))
+            else:
+                lc_history.append(AIMessage(content=msg["content"]))
+
+        return self.chain.invoke({
+            "question": user_message,
+            "search_query": search_query,
+            "history": lc_history,
+        })
 
 
 # ---------------------------------------------------------------------------
-# GROQ CHAT SERVICE
-#
-# Groq is a hosted API that runs open-source models (Llama 3.1) at very
-# high speed. The interface is identical to OpenAI's Chat Completions API.
-#
-# How RAG + memory works together:
-#   1. We search ChromaDB for law sections relevant to the user's message
-#   2. We inject those sections into the system prompt
-#   3. We include the full conversation history so Groq "remembers" the chat
-#   4. Groq sees: [system + law context] + [prior messages] + [new message]
+# SINGLETON
+# Loaded once at module import time. The embedding model and ChromaDB
+# connection are shared across all requests — same pattern as before.
 # ---------------------------------------------------------------------------
 
-class GroqChatService:
-    def __init__(self):
-        self.client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-        self.model = "llama-3.3-70b-versatile"
-
-    def get_reply(
-        self,
-        user_message: str,
-        history: list[dict],       # [{"role": "user"|"assistant", "content": "..."}]
-        law_context: list[str]     # retrieved law sections from ChromaDB
-    ) -> str:
-        """
-        Build the full prompt and call Groq.
-
-        The messages list sent to Groq looks like:
-          [
-            {"role": "system",    "content": "<SYSTEM_PROMPT + law sections>"},
-            {"role": "user",      "content": "previous message 1"},
-            {"role": "assistant", "content": "previous reply 1"},
-            ...
-            {"role": "user",      "content": "<current user message>"}
-          ]
-        """
-        system_content = SYSTEM_PROMPT
-        if law_context:
-            sections = "\n\n---\n\n".join(law_context)
-            system_content += f"\n\nRelevant Pakistani Law Sections:\n{sections}"
-
-        messages = [{"role": "system", "content": system_content}]
-        messages.extend(history)
-        messages.append({"role": "user", "content": user_message})
-
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=0.3,    # low temperature = more consistent, factual answers
-            max_tokens=1024,
-        )
-        return response.choices[0].message.content
-
-
-# ---------------------------------------------------------------------------
-# SINGLETONS
-#
-# We create one instance of each service when the module is first imported.
-# This means the embedding model and ChromaDB load once at startup,
-# not on every request. Both instances are imported directly in chat.py.
-# ---------------------------------------------------------------------------
-
-embedding_service = EmbeddingService()
-groq_service = GroqChatService()
+legal_chain = LegalAdvisorChain()
