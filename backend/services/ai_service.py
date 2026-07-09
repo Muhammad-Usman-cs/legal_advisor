@@ -201,6 +201,26 @@ def _enforce_citations(reply: str, valid_ids: set[str]) -> tuple[str, list[str]]
     return reply, warnings
 
 
+def _strip_source_tags(reply: str) -> str:
+    """
+    Remove the internal [SRC-N] citation markers before the reply is shown
+    to the user.
+
+    The [SRC-N] tags exist only so _enforce_citations() can verify the model
+    grounded its answer in the retrieved chunks. They are internal plumbing —
+    opaque IDs that mean nothing to an end user — so they must be stripped
+    from the user-facing text. This runs AFTER _enforce_citations() so the
+    grounding check still sees the original markers.
+
+    Also removes the whitespace immediately preceding each tag so that
+    "imprisonment [SRC-2]." cleanly becomes "imprisonment." rather than
+    leaving a double space before the period.
+    """
+    cleaned = re.sub(r'\s*\[SRC-\d+\]', '', reply)   # drop tags + leading space
+    cleaned = re.sub(r' {2,}', ' ', cleaned)          # collapse any doubled spaces
+    return cleaned.strip()
+
+
 # ---------------------------------------------------------------------------
 # LegalAdvisorChain
 #
@@ -447,6 +467,11 @@ class LegalAdvisorChain:
 
         # ── Step 7: Hard citation enforcement (log violations server-side) ─
         reply, _ = _enforce_citations(reply, valid_ids)
+
+        # ── Step 8: Strip internal [SRC-N] markers from the user-facing text ─
+        # Enforcement above already inspected the original markers; the user
+        # should never see these opaque internal IDs.
+        reply = _strip_source_tags(reply)
 
         return reply
 
