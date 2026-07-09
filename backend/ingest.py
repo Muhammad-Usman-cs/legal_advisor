@@ -30,25 +30,110 @@ CHROMA_PATH      = "./chroma_db"
 COLLECTION_NAME  = "pakistani_law"
 EMBEDDING_MODEL  = "BAAI/bge-small-en-v1.5"
 
-# BGE-small-en-v1.5 max sequence length is 512 tokens (~2000 chars).
-# 500 chars keeps every chunk well within that limit.
-CHUNK_SIZE    = 500
-CHUNK_OVERLAP = 100
+# 800 chars ≈ 200 tokens — well within BGE-small's 512-token limit.
+# Increased from 500 to accommodate a full legal provision in one chunk.
+CHUNK_SIZE    = 800
+CHUNK_OVERLAP = 50
 
-# Entries shorter than this after stripping are almost certainly empty
-# PDF extractions — skip them to avoid polluting the vector store.
+# Entries shorter than this are failed PDF extractions — skip them.
 MIN_TEXT_LENGTH = 200
+
+# Post-split: discard fragments shorter than this (leftover TOC lines).
+MIN_CHUNK_CHARS = 80
+
+
+# ---------------------------------------------------------------------------
+# TEXT CLEANING
+# ---------------------------------------------------------------------------
+
+def clean_text(text: str) -> str:
+    """
+    Safe PDF extraction cleanup:
+    - Normalise line endings
+    - Remove leading whitespace after newlines (e.g. "\n 379." → "\n379.")
+    - Collapse multiple spaces within a line to one
+    """
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    # Remove indentation that interferes with section-number detection
+    text = re.sub(r'\n[ \t]+', '\n', text)
+    # Collapse runs of spaces (not newlines) to one space
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    return text
+
+
+# ---------------------------------------------------------------------------
+# TOC STRIPPING
+# ---------------------------------------------------------------------------
+
+def strip_toc(text: str) -> str:
+    """
+    Remove the Table of Contents that many Pakistani law PDFs have at the top.
+
+    Why this matters:
+        The PPC has a TOC at chars 0-30,000 listing entries like:
+            "\\n379. Punishment for theft  \\n380. Theft in dwelling house..."
+        The ACTUAL provision is at char 381,587:
+            "\\n379. Punishment for theft.  Whoever commits theft shall be
+             punished with imprisonment..."
+        Without stripping, the TOC entries get indexed and retrieved instead
+        of the real provisions — causing context_precision = 0.00.
+
+    Detection:
+        In the TOC, each section title is short so consecutive section-number
+        matches are only ~30-50 chars apart.  In actual content, each section
+        has paragraph text so the gap is 200+ chars.  The first section whose
+        gap to the NEXT section exceeds 200 chars is where real content begins.
+    """
+    section_re = re.compile(r'\n\d+[A-Z]?\.\s')
+    matches = list(section_re.finditer(text))
+
+    if len(matches) < 5:
+        return text  # too few sections to have a meaningful TOC
+
+    for i in range(len(matches) - 1):
+        gap = matches[i + 1].start() - matches[i].start()
+        if gap > 200:
+            # This section has paragraph content after it — real content starts here
+            return text[matches[i].start():]
+
+    return text  # no TOC pattern found, use full text
 
 
 # ---------------------------------------------------------------------------
 # TITLE EXTRACTION
-# The pdf_data.json filenames are unreadable hashes like
-# "administrator00532129aba2e10fe634ab8fbd94c50b.pdf".
-# We extract a human-readable title from the text instead so that the
-# metadata attached to every chunk is meaningful for debugging retrieval.
 # ---------------------------------------------------------------------------
 
-# Common patterns found at the start of Pakistani law documents
+# ---------------------------------------------------------------------------
+# LAW KEY DETECTION
+# ---------------------------------------------------------------------------
+
+# Normalised law identifiers written into chunk metadata so ai_service.py
+# can filter ChromaDB to a specific law without knowing exact document titles.
+_LAW_KEY_PATTERNS: list[tuple[str, list[str]]] = [
+    ("ppc",          ["pakistan penal code", "penal code (xlv"]),
+    ("constitution", ["constitution of pakistan"]),
+    ("cpc",          ["code of civil procedure"]),
+    ("crpc",         ["code of criminal procedure", "criminal procedure code"]),
+    ("family",       ["muslim family laws", "family courts act",
+                      "dissolution of muslim marriages"]),
+    ("contract",     ["contract act"]),
+    ("labour",       ["industrial relations", "labour", "employment"]),
+    ("property",     ["transfer of property", "registration act",
+                      "land acquisition", "stamp act"]),
+]
+
+def _detect_law_key(title: str, filename: str) -> str:
+    combined = (title + " " + filename).lower()
+    for key, patterns in _LAW_KEY_PATTERNS:
+        if any(p in combined for p in patterns):
+            return key
+    return "other"
+
+
+# ---------------------------------------------------------------------------
+# TITLE EXTRACTION
+# ---------------------------------------------------------------------------
+
 _TITLE_PATTERNS = re.compile(
     r'(THE\s+[A-Z][A-Z\s,\(\)]+(?:ACT|ORDINANCE|CODE|ORDER|RULES?|REGULATIONS?)'
     r'|[A-Z][A-Z\s,\(\)]+(?:ACT|ORDINANCE|CODE|ORDER|RULES?|REGULATIONS?)'
@@ -57,17 +142,11 @@ _TITLE_PATTERNS = re.compile(
 )
 
 def _extract_title(text: str, fallback: str) -> str:
-    """
-    Extract the law title from the first ~500 chars of text.
-    Falls back to the filename if no recognisable title pattern is found.
-    """
+    """Extract a human-readable law title from the first 500 chars of text."""
     head = text[:500]
     match = _TITLE_PATTERNS.search(head)
     if match:
-        # Collapse internal whitespace and trim
-        title = re.sub(r'\s+', ' ', match.group(0)).strip()
-        return title[:120]
-    # Second attempt: first non-empty line that is longer than 15 chars
+        return re.sub(r'\s+', ' ', match.group(0)).strip()[:120]
     for line in head.splitlines():
         line = line.strip()
         if len(line) > 15:
@@ -82,14 +161,15 @@ def _extract_title(text: str, fallback: str) -> str:
 def load_json_dataset(path: Path) -> list[Document]:
     """
     Load the pdf_data.json dataset.
-    Each entry becomes one Document — the splitter will chunk it afterwards.
-    Entries with very little text (failed PDF extractions) are skipped.
+    Each entry is cleaned, stripped of its TOC, then passed to the splitter.
     """
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     docs: list[Document] = []
     skipped = 0
+    toc_stripped = 0
+
     for item in data:
         text     = item.get("text", item.get("content", "")).strip()
         filename = item.get("file_name", "unknown.pdf")
@@ -98,23 +178,35 @@ def load_json_dataset(path: Path) -> list[Document]:
             skipped += 1
             continue
 
-        title = _extract_title(text, fallback=filename)
+        text = clean_text(text)
+
+        stripped = strip_toc(text)
+        if len(stripped) < len(text) * 0.9:   # >10% removed → TOC was found
+            toc_stripped += 1
+
+        title   = _extract_title(text, fallback=filename)
+        law_key = _detect_law_key(title, filename)
         docs.append(Document(
-            page_content=text,
+            page_content=stripped,
             metadata={
-                "source":    title,       # human-readable law name
-                "file_name": filename,    # original filename for traceability
+                "source":    title,
+                "file_name": filename,
+                "law_key":   law_key,   # used by ai_service for filtered retrieval
             }
         ))
 
-    print(f"  Loaded {len(docs)} laws ({skipped} skipped — below {MIN_TEXT_LENGTH} char minimum)")
+    print(f"  Loaded {len(docs)} laws "
+          f"({skipped} skipped — below {MIN_TEXT_LENGTH} chars, "
+          f"{toc_stripped} TOCs removed)")
     return docs
 
 
 def load_pdf(path: Path) -> list[Document]:
-    """PyPDFLoader returns one Document per page with page number metadata."""
+    """PyPDFLoader returns one Document per page with page-number metadata."""
     loader = PyPDFLoader(str(path))
     docs   = loader.load()
+    for doc in docs:
+        doc.page_content = clean_text(doc.page_content)
     print(f"  Loaded {len(docs)} pages from {path.name}")
     return docs
 
@@ -122,6 +214,8 @@ def load_pdf(path: Path) -> list[Document]:
 def load_txt(path: Path) -> list[Document]:
     loader = TextLoader(str(path), autodetect_encoding=True)
     docs   = loader.load()
+    for doc in docs:
+        doc.page_content = clean_text(doc.page_content)
     print(f"  Loaded {len(docs)} document(s) from {path.name}")
     return docs
 
@@ -150,7 +244,7 @@ def main():
     parser.add_argument("--reset", action="store_true", help="Clear ChromaDB before ingesting")
     args = parser.parse_args()
 
-    # ── Embeddings ─────────────────────────────────────────────────────────
+    # ── Embeddings ─────────────────────────────────────────────────────────────
     print("Loading embedding model...")
     embeddings = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
@@ -158,7 +252,7 @@ def main():
         encode_kwargs={"normalize_embeddings": True},
     )
 
-    # ── Optional reset ──────────────────────────────────────────────────────
+    # ── Optional reset ──────────────────────────────────────────────────────────
     if args.reset:
         print("Resetting ChromaDB collection...")
         db = Chroma(
@@ -169,19 +263,14 @@ def main():
         db.delete_collection()
         print("Collection cleared.\n")
 
-    # ── Resolve source ──────────────────────────────────────────────────────
+    # ── Resolve source ──────────────────────────────────────────────────────────
     docs_dir = Path(args.dir) if args.dir else Path(__file__).parent.parent / "documents"
 
     if args.file:
-        # Single file explicitly specified
         all_raw_docs = load_file(Path(args.file))
-
     elif args.json:
-        # Explicit JSON dataset path
         all_raw_docs = load_json_dataset(Path(args.json))
-
     else:
-        # Auto-detect: prefer JSON dataset, fall back to individual PDFs/TXTs
         if not docs_dir.exists():
             print(f"Error: documents directory not found at {docs_dir}")
             sys.exit(1)
@@ -190,7 +279,6 @@ def main():
         pdf_files  = [f for f in docs_dir.iterdir() if f.suffix.lower() in (".pdf", ".txt")]
 
         if json_files:
-            # JSON dataset found — use it (covers all 967 laws at once)
             print(f"Found JSON dataset: {json_files[0].name}")
             all_raw_docs = load_json_dataset(json_files[0])
         elif pdf_files:
@@ -210,24 +298,46 @@ def main():
         print("No documents loaded. Exiting.")
         sys.exit(1)
 
-    # ── Split ───────────────────────────────────────────────────────────────
-    # RecursiveCharacterTextSplitter tries paragraph breaks first (\n\n),
-    # then newlines, then sentence ends, then spaces — never cuts mid-word.
-    # chunk_overlap=100 ensures a sentence at a chunk boundary appears in
-    # both adjacent chunks so no context is lost at the seam.
+    # ── Split ───────────────────────────────────────────────────────────────────
+    # Section-aware splitting:
+    #   Primary separator is a section-number pattern so each chunk begins with
+    #   its own section number, e.g. "379. Punishment for theft.  Whoever..."
+    #   This keeps the section number + provision text together in one chunk,
+    #   which is the root fix for context_precision = 0.00.
+    #
+    # keep_separator="start" — the matched section pattern stays at the START
+    #   of each new chunk, not discarded, so "379." is always in the chunk.
+    #
+    # chunk_size=800 — safe for BGE-small (512 tokens ≈ 2000 chars; 800 chars
+    #   ≈ 200 tokens). Large enough to hold a complete legal provision.
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ". ", " ", ""],
+        separators=[
+            r'\n\d+[A-Z]?\.\s',   # \n379.  or \n381A.  — section boundary
+            r'\n\n',
+            r'\n',
+            r'\.  ',              # double-space after period (PPC provision format)
+            r' ',
+            r'',
+        ],
+        is_separator_regex=True,
+        keep_separator="start",
     )
     chunks = splitter.split_documents(all_raw_docs)
-    print(f"\nSplit {len(all_raw_docs)} documents → {len(chunks)} chunks "
-          f"(size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})")
 
-    # ── Embed + store ───────────────────────────────────────────────────────
+    # Discard very short fragments — these are residual TOC lines or page headers
+    # that slipped through (e.g. "Page 22 of 179" or a lone section title).
+    before = len(chunks)
+    chunks = [c for c in chunks if len(c.page_content.strip()) >= MIN_CHUNK_CHARS]
+    discarded = before - len(chunks)
+
+    print(f"\nSplit {len(all_raw_docs)} documents → {len(chunks)} chunks "
+          f"(size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}, {discarded} short fragments discarded)")
+
+    # ── Embed + store ───────────────────────────────────────────────────────────
     print("Embedding and storing in ChromaDB (this may take a few minutes)...")
 
-    # Process in batches so progress is visible and memory stays bounded
     BATCH = 500
     db = None
     for i in range(0, len(chunks), BATCH):

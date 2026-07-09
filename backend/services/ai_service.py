@@ -20,6 +20,67 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# LAW DETECTION FOR METADATA-FILTERED RETRIEVAL
+#
+# When the user's query mentions a specific law, restrict ChromaDB to only
+# that law's chunks before retrieval.  This reduces competition from 110K
+# chunks to ~2-5K law-specific chunks, so the correct section wins.
+#
+# The filter is passed as a ChromaDB `where` clause:
+#   {"law_key": {"$eq": "ppc"}}
+# The `law_key` values must match what ingest.py writes into chunk metadata.
+# ---------------------------------------------------------------------------
+_LAW_SIGNALS: list[tuple[str, list[str]]] = [
+    ("ppc", [
+        "ppc", "pakistan penal code", "penal code",
+        # common section numbers that only appear in the PPC
+        "section 302", "section 300", "section 379", "section 392",
+        "section 420", "section 499", "section 311", "section 354",
+        # PPC-specific offence names
+        "theft", "murder", "robbery", "dacoity", "defamation",
+        "culpable homicide", "attempt to murder", "extortion",
+        "criminal breach of trust", "cheating", "mischief", "hurt",
+        "criminal force", "abduction", "kidnapping",
+    ]),
+    ("constitution", [
+        "constitution", "fundamental rights", "basic rights",
+        "article 25", "article 10", "article 8", "article 19", "article 20",
+        "parliament", "senate", "national assembly",
+        "federalism", "provincial assembly", "writ petition",
+    ]),
+    ("crpc", [
+        "crpc", "code of criminal procedure", "criminal procedure",
+        "first information report", "fir", "bail", "cognizable",
+        "magistrate", "sessions court", "warrant", "challan",
+    ]),
+    ("cpc", [
+        "cpc", "code of civil procedure", "civil procedure",
+        "civil suit", "plaint", "written statement", "decree",
+        "civil court", "execution of decree",
+    ]),
+    ("family", [
+        "muslim family laws", "family courts", "divorce", "khula",
+        "maintenance", "dower", "mehr", "nikah", "dissolution of marriage",
+    ]),
+]
+
+
+def detect_law_filter(query: str) -> tuple[dict | None, str | None]:
+    """
+    Detect which Pakistani law the query is about.
+
+    Returns:
+        (chroma_filter, law_key) where chroma_filter is the ChromaDB `where`
+        dict and law_key is the plain string (e.g. "ppc").
+        Both are None when no specific law is detected.
+    """
+    q = query.lower()
+    for law_key, signals in _LAW_SIGNALS:
+        if any(signal in q for signal in signals):
+            return {"law_key": {"$eq": law_key}}, law_key
+    return None, None
+
+# ---------------------------------------------------------------------------
 # CONSTANTS
 # ---------------------------------------------------------------------------
 CHROMA_PATH      = "./chroma_db"
@@ -30,8 +91,8 @@ EMBEDDING_MODEL  = "BAAI/bge-small-en-v1.5"
 # domain-specific reranker is preferred (e.g. bge-reranker-base).
 RERANKER_MODEL   = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-BM25_K    = 15   # candidates from sparse retrieval
-DENSE_K   = 15   # candidates from dense retrieval (before RRF)
+BM25_K    = 20   # candidates from sparse retrieval
+DENSE_K   = 20   # candidates from dense retrieval (before RRF)
 FINAL_K   = 5    # chunks sent to the LLM after reranking
 
 # ---------------------------------------------------------------------------
@@ -273,6 +334,48 @@ class LegalAdvisorChain:
         print(f"BM25 index built over {len(docs)} chunks.")
         return retriever
 
+    def _rrf_merge(self, *ranked_lists: list[Document], k: int = 60) -> list[Document]:
+        """
+        Reciprocal Rank Fusion across multiple ranked document lists.
+
+        RRF score for each document = sum of 1 / (k + rank_i) across all lists
+        where rank_i is its 1-based position in list i (0 if absent).
+
+        k=60 is the standard default — it dampens the impact of the top rank
+        so that a document ranked #1 in one list and #3 in another beats a
+        document ranked #1 in one list and absent from all others.
+
+        Used in place of EnsembleRetriever when the dense retriever needs a
+        dynamic per-query metadata filter (EnsembleRetriever uses a fixed
+        retriever object configured at startup, so it can't vary the filter).
+        """
+        scores: dict[str, float] = {}
+        doc_map: dict[str, Document] = {}
+        for ranked in ranked_lists:
+            for rank, doc in enumerate(ranked, start=1):
+                key = doc.page_content[:120]          # content fingerprint for dedup
+                scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank)
+                doc_map[key] = doc
+        return [doc_map[key] for key in sorted(scores, key=scores.__getitem__, reverse=True)]
+
+    def retrieve(self, query: str) -> list[Document]:
+        """
+        Run the full retrieval pipeline for a query: law detection → filtered
+        BM25 + dense → RRF merge → CrossEncoder rerank.
+        Exposed so evaluate.py can inspect what the LLM actually receives.
+        """
+        law_filter, law_key = detect_law_filter(query)
+
+        if law_filter is not None:
+            dense_docs = self.vectorstore.similarity_search(query, k=DENSE_K, filter=law_filter)
+            bm25_raw   = self.bm25_retriever.invoke(query) if self.bm25_retriever else []
+            bm25_docs  = [d for d in bm25_raw if d.metadata.get("law_key") == law_key]
+            candidates = self._rrf_merge(bm25_docs, dense_docs)
+        else:
+            candidates = self.retriever.invoke(query)
+
+        return self._rerank(query, candidates, top_k=FINAL_K)
+
     def _rerank(self, query: str, docs: list[Document], top_k: int = FINAL_K) -> list[Document]:
         """
         Second-pass precision scoring with a cross-encoder.
@@ -300,7 +403,34 @@ class LegalAdvisorChain:
         ]
 
         # ── Step 1 + 2 + 3: Hybrid retrieval with RRF fusion ──────────────
-        candidates = self.retriever.invoke(search_query)
+        # detect_law_filter() checks for law-specific signals in the query.
+        # If a law is detected, dense retrieval is scoped to that law's chunks
+        # only, eliminating cross-law false positives (e.g. Hudood Ordinance
+        # chunks that reference the PPC outscoring actual PPC sections).
+        # BM25 still searches all chunks — it's an in-memory index so no
+        # ChromaDB filter can be applied, but RRF down-weights its results
+        # when the dense retriever is focused and returns strong matches.
+        law_filter, law_key = detect_law_filter(search_query)
+
+        if law_filter is not None:
+            logger.info("Applying law filter: %s", law_filter)
+
+            # Dense: ChromaDB restricts to law_key chunks only
+            dense_docs = self.vectorstore.similarity_search(
+                search_query, k=DENSE_K, filter=law_filter
+            )
+
+            # BM25 has no native metadata filter — it returns results from all
+            # laws. Post-filter to the same law_key so Hudood Ordinance / other
+            # law chunks that merely reference the PPC don't contaminate the
+            # RRF merge and beat actual PPC sections.
+            bm25_raw  = self.bm25_retriever.invoke(search_query) if self.bm25_retriever else []
+            bm25_docs = [d for d in bm25_raw if d.metadata.get("law_key") == law_key]
+
+            candidates = self._rrf_merge(bm25_docs, dense_docs)
+        else:
+            # No specific law detected — search all chunks via EnsembleRetriever
+            candidates = self.retriever.invoke(search_query)
 
         # ── Step 4: Rerank with cross-encoder ─────────────────────────────
         reranked = self._rerank(search_query, candidates, top_k=FINAL_K)

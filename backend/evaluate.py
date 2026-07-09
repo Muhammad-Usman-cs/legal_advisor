@@ -1,13 +1,13 @@
 """
-RAG Evaluation Script — measures retrieval + generation quality using RAGAS.
+RAG Evaluation Script -- measures retrieval + generation quality using RAGAS.
 
 The full 967-law corpus stays in ChromaDB untouched.
-Evaluation uses a SEPARATE handcrafted Q&A set — not a split of the corpus.
+Evaluation uses a SEPARATE handcrafted Q&A set -- not a split of the corpus.
 
 Why you can't split legal data for evaluation
 ---------------------------------------------
 Standard ML train/test splits work when examples are independent (e.g. images).
-Pakistani law is NOT independent — answering "Is Section 302 related to Section
+Pakistani law is NOT independent -- answering "Is Section 302 related to Section
 311?" requires BOTH sections to be in the retrieval corpus simultaneously.
 Holding out sections for a "test set" would make correct answers impossible.
 
@@ -38,7 +38,6 @@ from services.ai_service import legal_chain
 #
 # These are hand-verified question/answer pairs drawn from the law corpus.
 # ground_truth = the correct answer as it appears in the actual law text.
-# Add more entries as you verify more sections from your 967-law dataset.
 # ---------------------------------------------------------------------------
 EVAL_SET = [
     {
@@ -86,53 +85,45 @@ EVAL_SET = [
             "or fine, or both."
         ),
     },
-    # ── Add more entries here as you verify them against your documents ──
-    # {
-    #     "question": "...",
-    #     "ground_truth": "...",
-    # },
 ]
 
 
+# ---------------------------------------------------------------------------
+# RAG OUTPUT COLLECTION
+# ---------------------------------------------------------------------------
+
 def collect_rag_outputs(eval_set: list[dict]) -> list[dict]:
-    """
-    Run each question through the full RAG pipeline and collect:
-      - the generated answer
-      - the retrieved context chunks (before generation)
-    """
+    """Run each question through the full RAG pipeline and collect answer + contexts."""
     rows = []
     total = len(eval_set)
     for i, item in enumerate(eval_set, 1):
         question = item["question"]
         print(f"  [{i}/{total}] {question[:70]}...")
 
-        # ── Retrieve (same pipeline as get_reply, but exposed here) ────────
-        recent_user   = []                             # no prior history in eval
-        search_query  = question
-        candidates    = legal_chain.retriever.invoke(search_query)
-        reranked      = legal_chain._rerank(search_query, candidates)
-        contexts      = [doc.page_content for doc in reranked]
-
-        # ── Generate ────────────────────────────────────────────────────────
-        answer = legal_chain.get_reply(question, history=[])
+        reranked = legal_chain.retrieve(question)
+        contexts = [doc.page_content for doc in reranked]
+        answer     = legal_chain.get_reply(question, history=[])
 
         rows.append({
             "question":     question,
             "answer":       answer,
-            "contexts":     contexts,    # list of strings — what RAGAS inspects
+            "contexts":     contexts,
             "ground_truth": item["ground_truth"],
         })
 
     return rows
 
 
+# ---------------------------------------------------------------------------
+# RAGAS SCORING
+# ---------------------------------------------------------------------------
+
 def _patch_langchain_community():
     """
-    RAGAS 0.4.3 imports langchain_community.chat_models.vertexai at startup,
-    but langchain-community 0.4.x removed that module (moved to langchain-google-vertexai).
-    Inject a shim into sys.modules before RAGAS loads so the import succeeds.
+    Shim for RAGAS 0.4.3 which imports langchain_community.chat_models.vertexai
+    at startup. That module was removed in langchain-community 0.4.x. Inject an
+    empty module so the import does not crash before we even start scoring.
     """
-    import sys
     from types import ModuleType
     key = "langchain_community.chat_models.vertexai"
     if key not in sys.modules:
@@ -142,42 +133,37 @@ def _patch_langchain_community():
             shim.ChatVertexAI = getattr(_gv, "ChatVertexAI", None)
             sys.modules[key] = shim
         except ImportError:
-            sys.modules[key] = ModuleType(key)  # empty shim — vertexai not installed
+            sys.modules[key] = ModuleType(key)
 
 
 def run_ragas(rows: list[dict]):
-    """Score the collected outputs with RAGAS metrics."""
     _patch_langchain_community()
+
     try:
         from datasets import Dataset
         from ragas import evaluate
-        from ragas.metrics import (
+        from ragas.metrics.collections import (
+            faithfulness,
             answer_relevancy,
             context_precision,
             context_recall,
-            faithfulness,
         )
         from ragas.llms import LangchainLLMWrapper
-        from ragas.embeddings import LangchainEmbeddingsWrapper
+        from ragas.embeddings import HuggingFaceEmbeddings as RagasHFEmbeddings
         from langchain_groq import ChatGroq
-        from langchain_huggingface import HuggingFaceEmbeddings
     except ImportError as e:
         print(f"\nMissing dependency: {e}")
-        print("Run: pip install ragas datasets")
-        return
+        print("Install with:  pip install ragas==0.4.3 datasets==5.0.0")
+        sys.exit(1)
 
     dataset = Dataset.from_list(rows)
 
-    # Reuse the same LLM and embedding model already configured in the project
+    # Use the small 8B model as judge to avoid burning the 100K/day token quota
+    # on evaluation calls (the 70B model is reserved for actual user queries).
     judge_llm = LangchainLLMWrapper(
-        ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+        ChatGroq(model="llama-3.1-8b-instant", temperature=0)
     )
-    judge_emb = LangchainEmbeddingsWrapper(
-        HuggingFaceEmbeddings(
-            model_name="BAAI/bge-small-en-v1.5",
-            encode_kwargs={"normalize_embeddings": True},
-        )
-    )
+    judge_emb = RagasHFEmbeddings(model="BAAI/bge-small-en-v1.5")
 
     print("\nScoring with RAGAS...")
     results = evaluate(
@@ -187,59 +173,59 @@ def run_ragas(rows: list[dict]):
         embeddings=judge_emb,
     )
 
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print("RAGAS SCORES")
-    print("="*50)
+    print("=" * 50)
     print(results)
     print()
 
-    # Per-question breakdown
     df = results.to_pandas()
     print("Per-question breakdown:")
-    cols = ["question", "faithfulness", "answer_relevancy", "context_precision", "context_recall"]
+    cols      = ["question", "faithfulness", "answer_relevancy", "context_precision", "context_recall"]
     available = [c for c in cols if c in df.columns]
     print(df[available].to_string(index=False))
 
     df.to_csv("eval_results.csv", index=False)
     print("\nFull results saved to eval_results.csv")
 
-    # Guidance based on scores
-    print("\n── What your scores mean ──")
-    print(results)
+    print("\n-- What your scores mean --")
+    metric_cols = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
     scores = {
-        "faithfulness":      float(results.get("faithfulness",      0)),
-        "answer_relevancy":  float(results.get("answer_relevancy",  0)),
-        "context_precision": float(results.get("context_precision", 0)),
-        "context_recall":    float(results.get("context_recall",    0)),
+        col: float(df[col].mean()) if col in df.columns else 0.0
+        for col in metric_cols
     }
     for metric, score in scores.items():
         if score < 0.7:
             if metric == "faithfulness":
-                print(f"  ⚠  {metric}={score:.2f} — LLM is hallucinating. Tighten system prompt grounding rules.")
+                print(f"  [!] {metric}={score:.2f} -- LLM is hallucinating. Tighten system prompt grounding rules.")
             elif metric == "context_precision":
-                print(f"  ⚠  {metric}={score:.2f} — Retriever pulls irrelevant chunks. Consider raising reranker threshold.")
+                print(f"  [!] {metric}={score:.2f} -- Retriever pulls irrelevant chunks. Consider metadata filtering.")
             elif metric == "context_recall":
-                print(f"  ⚠  {metric}={score:.2f} — Retriever misses the right section. Check chunking or increase BM25_K/DENSE_K.")
+                print(f"  [!] {metric}={score:.2f} -- Retriever misses the right section. Increase BM25_K/DENSE_K.")
             elif metric == "answer_relevancy":
-                print(f"  ⚠  {metric}={score:.2f} — Answer is off-topic. Lower temperature or tighten the prompt.")
+                print(f"  [!] {metric}={score:.2f} -- Answer is off-topic. Lower temperature or tighten the prompt.")
         else:
-            print(f"  ✓  {metric}={score:.2f}")
+            print(f"  [ok] {metric}={score:.2f}")
 
+
+# ---------------------------------------------------------------------------
+# RETRIEVAL-ONLY INSPECTION (no RAGAS install needed)
+# ---------------------------------------------------------------------------
 
 def run_retrieval_only(rows: list[dict]):
-    """
-    Lightweight evaluation without RAGAS — just prints what was retrieved
-    so you can manually verify retrieval quality.
-    Useful before installing ragas or when debugging a specific question.
-    """
-    print("\n── Retrieval-only inspection ──")
+    """Print retrieved chunks for manual inspection -- no RAGAS scoring."""
+    print("\n-- Retrieval-only inspection --")
     for row in rows:
         print(f"\nQ: {row['question']}")
         print(f"Retrieved {len(row['contexts'])} chunks:")
         for i, ctx in enumerate(row['contexts'], 1):
-            print(f"  [{i}] {ctx[:150].strip()}...")
+            print(f"  [{i}] {ctx[:200].strip()}...")
         print(f"Answer (first 200 chars): {row['answer'][:200]}...")
 
+
+# ---------------------------------------------------------------------------
+# ENTRY POINT
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse
@@ -247,12 +233,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--retrieval-only",
         action="store_true",
-        help="Print retrieved chunks only — no RAGAS scoring (no extra install needed)"
+        help="Print retrieved chunks only -- no RAGAS scoring (no extra install needed)",
     )
     args = parser.parse_args()
 
     print(f"Running evaluation on {len(EVAL_SET)} questions...")
-    print("(Full 967-law corpus stays in ChromaDB — no data is split)\n")
+    print("(Full 967-law corpus stays in ChromaDB -- no data is split)\n")
 
     rows = collect_rag_outputs(EVAL_SET)
 
