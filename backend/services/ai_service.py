@@ -95,6 +95,21 @@ BM25_K    = 20   # candidates from sparse retrieval
 DENSE_K   = 20   # candidates from dense retrieval (before RRF)
 FINAL_K   = 5    # chunks sent to the LLM after reranking
 
+# Cross-encoder relevance floor.
+# ms-marco-MiniLM outputs an UNBOUNDED logit per (query, chunk) pair — NOT a
+# 0-1 probability. Higher = more relevant; empirically a score above ~0 means
+# the chunk is on-topic, negative means off-topic. Any chunk below this floor
+# is dropped from the final set. When NO chunk clears the floor, the LLM
+# receives an empty [LAW CONTEXT] and the system prompt's "I could not find
+# the specific provision" path fires — instead of the model treating weak,
+# irrelevant chunks as authoritative and hallucinating around them.
+#
+# 0.0 is a conservative starting point. CALIBRATE it: _rerank() logs the top
+# scores per query, so run a few known-good and known-bad questions, watch the
+# logs, and raise/lower the floor until on-topic chunks pass and off-topic
+# ones are rejected.
+RERANK_SCORE_FLOOR = 0.0
+
 # ---------------------------------------------------------------------------
 # SYSTEM PROMPT
 #
@@ -246,6 +261,7 @@ class LegalAdvisorChain:
             model_name=EMBEDDING_MODEL,
             model_kwargs={"device": "cpu"},
             encode_kwargs={"normalize_embeddings": True},
+            query_instruction="Represent this sentence for searching relevant passages: ",
         )
 
         self.vectorstore = Chroma(
@@ -312,7 +328,7 @@ class LegalAdvisorChain:
         # -----------------------------------------------------------------
         self.llm = ChatGroq(
             model="llama-3.3-70b-versatile",
-            temperature=0.3,
+            temperature=0.0,
             max_tokens=2048,
         )
 
@@ -401,14 +417,30 @@ class LegalAdvisorChain:
         Second-pass precision scoring with a cross-encoder.
         The cross-encoder reads (query, chunk) together — not separately —
         so it catches relevance signals that bi-encoder embeddings miss.
-        Returns the top_k documents sorted by cross-encoder score descending.
+        Returns up to top_k documents sorted by cross-encoder score descending,
+        keeping only those whose score clears RERANK_SCORE_FLOOR. If none clear
+        it, returns [] — deliberately triggering the abstention path downstream
+        (empty context → "I could not find the specific provision" reply).
         """
         if not docs:
             return []
         pairs  = [[query, doc.page_content] for doc in docs]
-        scores = self.reranker.predict(pairs)  # float array, one per pair
+        scores = self.reranker.predict(pairs)  # unbounded logits, one per pair
         ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
-        return [doc for _, doc in ranked[:top_k]]
+
+        # Log the best scores so RERANK_SCORE_FLOOR can be calibrated on real queries.
+        top_preview = [round(float(s), 2) for s, _ in ranked[:top_k]]
+        logger.info("Rerank top-%d scores: %s (floor=%.2f)",
+                    top_k, top_preview, RERANK_SCORE_FLOOR)
+
+        kept = [doc for score, doc in ranked[:top_k] if float(score) >= RERANK_SCORE_FLOOR]
+        if not kept:
+            logger.warning(
+                "No chunk cleared the rerank floor (%.2f) for query %r — "
+                "returning empty context (abstention path).",
+                RERANK_SCORE_FLOOR, query[:100],
+            )
+        return kept
 
     def get_reply(self, user_message: str, history: list[dict]) -> str:
         # Build context-aware search query (last user turn + current message)
